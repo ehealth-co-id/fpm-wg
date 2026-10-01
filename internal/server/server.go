@@ -1,5 +1,9 @@
-// Package server accepts FRR's dplane_fpm_nl TCP connection and feeds decoded
-// messages to the syncer.
+// Package server accepts FRR's dplane_fpm_nl TCP connection and triggers
+// reconciliation of WireGuard allowed-ips.
+//
+// The stream content is not interpreted: any dplane event is a signal that the
+// FIB may have changed, and the syncer re-reads the kernel routing table. This
+// keeps fpm-wg independent of FRR's internal nexthop representation.
 package server
 
 import (
@@ -42,10 +46,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			if errors.Is(err, net.ErrClosed) {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			return err
@@ -54,8 +55,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
-// handle processes one zebra connection to completion. FRR dials out and, on
-// connect, replays the entire RIB, so peers are reloaded before processing.
+// handle drains one zebra connection. FRR dials out and replays the whole RIB
+// on connect, so peers are reloaded and a reconcile is scheduled per event.
 func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	from := conn.RemoteAddr().String()
@@ -63,8 +64,9 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	if err := s.syn.Load(); err != nil {
 		s.log.Error("load peers failed", "err", err)
 	}
+	s.syn.Notify()
 
-	var frames, routes int
+	var frames int
 	for ctx.Err() == nil {
 		f, err := fpm.ReadFrame(conn)
 		if err != nil {
@@ -77,20 +79,11 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 			s.log.Warn("unexpected frame header", "version", f.Version, "type", f.Type)
 			continue
 		}
-		msgs, err := fpm.DecodeAll(f.Payload)
-		if err != nil {
-			s.log.Warn("decode payload", "err", err)
-		}
-		for _, m := range msgs {
-			if m.Kind == fpm.KindRoute {
-				routes++
-			}
-			s.syn.Apply(m)
-		}
+		s.syn.Notify()
 		frames++
 	}
-	if err := s.syn.Flush(); err != nil {
-		s.log.Error("final flush", "err", err)
+	if err := s.syn.Reconcile(); err != nil {
+		s.log.Error("final reconcile", "err", err)
 	}
-	s.log.Info("fpm disconnected", "from", from, "frames", frames, "routes", routes)
+	s.log.Info("fpm disconnected", "from", from, "frames", frames)
 }

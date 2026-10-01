@@ -1,14 +1,12 @@
 package syncer
 
 import (
-	"encoding/hex"
 	"io"
 	"log/slog"
 	"net/netip"
+	"sort"
 	"testing"
-	"time"
 
-	"github.com/ehealthid/fpm-wg/internal/fpm"
 	wg "github.com/ehealthid/fpm-wg/internal/wg"
 )
 
@@ -17,11 +15,8 @@ type fakeApplier struct {
 	sets  int
 }
 
-func newFake() *fakeApplier {
-	return &fakeApplier{peers: map[string][]netip.Prefix{
-		"PEER3": {netip.MustParsePrefix("192.168.200.3/32")},
-		"PEER5": {netip.MustParsePrefix("192.168.200.5/32")},
-	}}
+func newFake(peers map[string][]netip.Prefix) *fakeApplier {
+	return &fakeApplier{peers: peers}
 }
 
 func (f *fakeApplier) Peers(string) ([]wg.Peer, error) {
@@ -38,131 +33,126 @@ func (f *fakeApplier) SetAllowedIPs(_, key string, ips []netip.Prefix) error {
 	return nil
 }
 
-func (f *fakeApplier) has(key, p string) bool {
-	want := netip.MustParsePrefix(p)
-	for _, ip := range f.peers[key] {
-		if ip == want {
-			return true
-		}
+func (f *fakeApplier) get(key string) []string {
+	var ss []string
+	for _, p := range f.peers[key] {
+		ss = append(ss, p.String())
 	}
-	return false
+	sort.Strings(ss)
+	return ss
 }
 
-func newTest(t *testing.T) (*Syncer, *fakeApplier) {
+type fakeRIB struct{ routes map[netip.Prefix]netip.Addr }
+
+func (f *fakeRIB) fn(string) (map[netip.Prefix]netip.Addr, error) { return f.routes, nil }
+
+func newSyncer(t *testing.T, app *fakeApplier, ribfn RIBFunc) *Syncer {
 	t.Helper()
-	f := newFake()
-	s := New("wg0", netip.MustParsePrefix("192.168.200.0/24"), f,
-		10*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := New(Options{
+		Iface:     "wg0",
+		TunnelNet: netip.MustParsePrefix("192.168.200.0/24"),
+		Applier:   app,
+		RIB:       ribfn,
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
 	if err := s.Load(); err != nil {
 		t.Fatal(err)
 	}
-	return s, f
+	return s
 }
 
-func nh(id uint32, gw string) fpm.Msg {
-	return fpm.Msg{Kind: fpm.KindNexthop, Nexthop: &fpm.Nexthop{
-		ID: id, Gateway: netip.MustParseAddr(gw), HasGW: true}}
-}
-
-func route(typ uint16, prefix string, nhid uint32) fpm.Msg {
-	return fpm.Msg{Type: typ, Kind: fpm.KindRoute, Route: &fpm.Route{
-		Prefix: netip.MustParsePrefix(prefix), NexthopID: nhid, HasNhID: nhid != 0}}
-}
-
-func TestAddDeleteLifecycle(t *testing.T) {
-	s, f := newTest(t)
-	s.Apply(nh(15, "192.168.200.3"))
-	s.Apply(nh(16, "192.168.200.5"))
-	s.Apply(route(rtmNewRoute, "192.168.0.0/24", 15))
-	s.Apply(route(rtmNewRoute, "192.168.3.0/24", 16))
-	// both peers dirty in one window -> coalesced into one SetAllowedIPs each
-	if err := s.Flush(); err != nil {
-		t.Fatal(err)
+func eq(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	sort.Strings(want)
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
 	}
-	if f.sets != 2 {
-		t.Errorf("sets = %d, want 2 (coalesced)", f.sets)
-	}
-	if !f.has("PEER3", "192.168.0.0/24") || !f.has("PEER5", "192.168.3.0/24") {
-		t.Fatalf("adds wrong: %v", f.peers)
-	}
-
-	s.Apply(route(rtmDelRoute, "192.168.3.0/24", 0))
-	if err := s.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	if f.has("PEER5", "192.168.3.0/24") {
-		t.Errorf("delete did not remove prefix: %v", f.peers["PEER5"])
-	}
-	if !f.has("PEER5", "192.168.200.5/32") {
-		t.Errorf("base tunnel ip lost on peer5: %v", f.peers["PEER5"])
-	}
-}
-
-func TestIdempotentAndBaseProtected(t *testing.T) {
-	s, f := newTest(t)
-	s.Apply(nh(15, "192.168.200.3"))
-	s.Apply(route(rtmNewRoute, "192.168.0.0/24", 15))
-	s.Apply(route(rtmNewRoute, "192.168.0.0/24", 15)) // duplicate
-	s.Apply(route(rtmNewRoute, "192.168.0.0/24", 15)) // duplicate
-	if err := s.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	var got int
-	for _, ip := range f.peers["PEER3"] {
-		if ip == netip.MustParsePrefix("192.168.0.0/24") {
-			got++
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
 		}
 	}
-	if got != 1 {
-		t.Errorf("duplicate learns: count=%d", got)
-	}
-
-	// A delete for a base tunnel prefix must be a no-op.
-	s.Apply(route(rtmDelRoute, "192.168.200.3/32", 0))
-	if err := s.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	if !f.has("PEER3", "192.168.200.3/32") {
-		t.Error("base tunnel /32 removed by delete")
-	}
 }
 
-func TestUnknownGatewayIgnored(t *testing.T) {
-	s, f := newTest(t)
-	s.Apply(nh(7, "172.24.128.1")) // not a peer tunnel addr
-	s.Apply(route(rtmNewRoute, "172.24.128.0/20", 7))
-	if err := s.Flush(); err != nil {
+func TestReconcileFromKernel(t *testing.T) {
+	app := newFake(map[string][]netip.Prefix{
+		"PEER3": {netip.MustParsePrefix("192.168.200.3/32")},
+		"PEER5": {netip.MustParsePrefix("192.168.200.5/32")},
+	})
+	rib := &fakeRIB{routes: map[netip.Prefix]netip.Addr{
+		netip.MustParsePrefix("192.168.0.0/24"): netip.MustParseAddr("192.168.200.3"),
+		netip.MustParsePrefix("10.255.0.5/32"):  netip.MustParseAddr("192.168.200.5"),
+		netip.MustParsePrefix("172.24.0.0/16"):  netip.MustParseAddr("172.24.128.1"), // not a peer
+	}}
+	s := newSyncer(t, app, rib.fn)
+	if err := s.Reconcile(); err != nil {
 		t.Fatal(err)
 	}
-	if f.sets != 0 {
-		t.Errorf("non-peer route caused %d applies", f.sets)
-	}
+	eq(t, app.get("PEER3"), "192.168.0.0/24", "192.168.200.3/32")
+	eq(t, app.get("PEER5"), "10.255.0.5/32", "192.168.200.5/32")
 }
 
-// Integration: decode the real FRR 10.6.2 frames captured in the lab, then sync.
-func TestRealFrames(t *testing.T) {
-	hexes := []string{
-		"30000000680001050000000094a2ebdc02000b0000000000080001000f00000008000600c0a8c8030800050003000000",         // NH 15 -> 192.168.200.3
-		"34000000180001050000000094a2ebdc02180000fec400010000000008000100c0a80000080006001400000008001e000f000000", // route 192.168.0.0/24 nhid15
+// Regression: a prefix must move to the correct peer when its kernel nexthop
+// changes (the bug that broke e<->c when FRR renumbered nexthop groups).
+func TestPrefixMovesBetweenPeers(t *testing.T) {
+	app := newFake(map[string][]netip.Prefix{
+		"PEER3": {netip.MustParsePrefix("192.168.200.3/32")},
+		"PEER5": {netip.MustParsePrefix("192.168.200.5/32")},
+	})
+	// First state: 10.255.0.5/32 is (wrongly) attributed to PEER3.
+	app.peers["PEER3"] = []netip.Prefix{
+		netip.MustParsePrefix("192.168.200.3/32"),
+		netip.MustParsePrefix("10.255.0.5/32"),
 	}
-	s, f := newTest(t)
-	for _, h := range hexes {
-		b, err := hex.DecodeString(h)
-		if err != nil {
-			t.Fatal(err)
-		}
-		msgs, err := fpm.DecodeAll(b)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, m := range msgs {
-			s.Apply(m)
-		}
-	}
-	if err := s.Flush(); err != nil {
+	rib := &fakeRIB{routes: map[netip.Prefix]netip.Addr{
+		netip.MustParsePrefix("10.255.0.5/32"): netip.MustParseAddr("192.168.200.5"),
+	}}
+	s := newSyncer(t, app, rib.fn)
+	if err := s.Reconcile(); err != nil {
 		t.Fatal(err)
 	}
-	if !f.has("PEER3", "192.168.0.0/24") {
-		t.Fatalf("real-frame sync failed: %v", f.peers["PEER3"])
+	eq(t, app.get("PEER3"), "192.168.200.3/32")                  // stale entry dropped
+	eq(t, app.get("PEER5"), "10.255.0.5/32", "192.168.200.5/32") // and attributed correctly
+}
+
+func TestWithdrawRemovesPrefix(t *testing.T) {
+	app := newFake(map[string][]netip.Prefix{
+		"PEER5": {netip.MustParsePrefix("192.168.200.5/32")},
+	})
+	rib := &fakeRIB{routes: map[netip.Prefix]netip.Addr{
+		netip.MustParsePrefix("192.168.3.0/24"): netip.MustParseAddr("192.168.200.5"),
+	}}
+	s := newSyncer(t, app, rib.fn)
+	if err := s.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, app.get("PEER5"), "192.168.3.0/24", "192.168.200.5/32")
+
+	rib.routes = map[netip.Prefix]netip.Addr{} // route withdrawn from the kernel
+	if err := s.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, app.get("PEER5"), "192.168.200.5/32")
+}
+
+func TestNoOpWhenUnchanged(t *testing.T) {
+	app := newFake(map[string][]netip.Prefix{
+		"PEER5": {netip.MustParsePrefix("192.168.200.5/32")},
+	})
+	rib := &fakeRIB{routes: map[netip.Prefix]netip.Addr{
+		netip.MustParsePrefix("192.168.3.0/24"): netip.MustParseAddr("192.168.200.5"),
+	}}
+	s := newSyncer(t, app, rib.fn)
+	if err := s.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	if app.sets != 1 {
+		t.Fatalf("sets = %d, want 1", app.sets)
+	}
+	if err := s.Reconcile(); err != nil { // unchanged -> no write
+		t.Fatal(err)
+	}
+	if app.sets != 1 {
+		t.Fatalf("idempotent reconcile wrote again: sets = %d", app.sets)
 	}
 }

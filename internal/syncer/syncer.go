@@ -1,11 +1,14 @@
-// Package syncer maps FRR dplane events to WireGuard allowed-ips.
+// Package syncer keeps WireGuard allowed-ips in sync with the kernel FIB.
 //
-// It replaces the update_wireguard.lua hook: on a route install it resolves the
-// wg0 nexthop to a peer and adds the prefix to that peer's allowed-ips; on a
-// route delete it strips the prefix from whichever peer holds it. Changes are
-// coalesced (the FPM module replays the whole RIB on connect) and applied as a
-// full-list replace per peer, so the applier is called at most once per peer
-// per flush window.
+// FRR's dplane_fpm_nl stream is used only as a trigger: on any route event the
+// syncer re-reads the kernel routing table and recomputes, for each peer, the
+// set of prefixes reachable through it. The kernel is the source of truth, so
+// no FRR-internal nexthop ids are ever interpreted (those are reused and were
+// the cause of prefixes being attributed to the wrong peer).
+//
+// Reconciliation is idempotent and self-healing: a full desired state is
+// computed every time and applied only when it differs from what was last
+// written.
 package syncer
 
 import (
@@ -13,61 +16,75 @@ import (
 	"log/slog"
 	"net/netip"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/ehealthid/fpm-wg/internal/fpm"
 	wg "github.com/ehealthid/fpm-wg/internal/wg"
 )
 
-// netlink route message types (linux/rtnetlink.h).
-const (
-	rtmNewRoute = 24
-	rtmDelRoute = 25
-)
+// RIBFunc returns prefix -> gateway for the routes egressing iface.
+type RIBFunc func(iface string) (map[netip.Prefix]netip.Addr, error)
 
-type peerState struct {
-	key     string
-	allowed []netip.Prefix
-	managed map[netip.Prefix]struct{} // prefixes we added (never the base tunnel /32)
-	dirty   bool
+// Options configures a Syncer.
+type Options struct {
+	Iface             string
+	TunnelNet         netip.Prefix // restricts which /32 allowed-ips are peer tunnel addrs
+	Applier           wg.Applier
+	RIB               RIBFunc
+	FlushInterval     time.Duration // coalescing window for event-driven reconciles
+	ReconcileInterval time.Duration // periodic safety-net reconcile (0 disables)
+	Logger            *slog.Logger
 }
 
-// Syncer keeps the desired allowed-ips for every peer on one interface.
+// Syncer reconciles one WireGuard interface against the kernel FIB.
 type Syncer struct {
-	iface      string
-	tunnelNet  netip.Prefix
-	haveTunnel bool
-	app        wg.Applier
-	log        *slog.Logger
-	flushEvery time.Duration
-	kick       chan struct{}
+	iface     string
+	tunnelNet netip.Prefix
+	haveTun   bool
+	app       wg.Applier
+	rib       RIBFunc
+	log       *slog.Logger
+	flush     time.Duration
+	reconcile time.Duration
+	kick      chan struct{}
 
-	mu     sync.Mutex
-	byKey  map[string]*peerState
-	byAddr map[netip.Addr]string // peer tunnel addr -> key
-	nh     map[uint32]netip.Addr // nexthop-object id -> gateway
+	mu      sync.Mutex
+	base    map[string][]netip.Prefix // key -> peer tunnel /32s (never touched)
+	byAddr  map[netip.Addr]string     // peer tunnel addr -> key
+	applied map[string]string         // key -> serialized allowed-ips last written
 }
 
-// New builds a Syncer. tunnelNet (optional) restricts which /32 allowed-ips are
-// treated as a peer's tunnel address.
-func New(iface string, tunnelNet netip.Prefix, app wg.Applier, flushEvery time.Duration, log *slog.Logger) *Syncer {
+// New builds a Syncer with defaults filled in.
+func New(o Options) *Syncer {
+	if o.FlushInterval <= 0 {
+		o.FlushInterval = 100 * time.Millisecond
+	}
+	if o.ReconcileInterval < 0 {
+		o.ReconcileInterval = 0
+	}
+	if o.Logger == nil {
+		o.Logger = slog.Default()
+	}
 	return &Syncer{
-		iface:      iface,
-		tunnelNet:  tunnelNet,
-		haveTunnel: tunnelNet.IsValid(),
-		app:        app,
-		log:        log,
-		flushEvery: flushEvery,
-		kick:       make(chan struct{}, 1),
-		byKey:      map[string]*peerState{},
-		byAddr:     map[netip.Addr]string{},
-		nh:         map[uint32]netip.Addr{},
+		iface:     o.Iface,
+		tunnelNet: o.TunnelNet,
+		haveTun:   o.TunnelNet.IsValid(),
+		app:       o.Applier,
+		rib:       o.RIB,
+		log:       o.Logger,
+		flush:     o.FlushInterval,
+		reconcile: o.ReconcileInterval,
+		kick:      make(chan struct{}, 1),
+		base:      map[string][]netip.Prefix{},
+		byAddr:    map[netip.Addr]string{},
+		applied:   map[string]string{},
 	}
 }
 
-// Load refreshes peers and allowed-ips from the applier (source of truth).
-// Call on every (re)connect, before processing the replayed RIB.
+// Load refreshes the peer set from the applier. Only each peer's tunnel /32(s)
+// are treated as base state; every other allowed-ip is derived from the FIB on
+// the next reconcile (so a previously wrong state is corrected, not adopted).
 func (s *Syncer) Load() error {
 	peers, err := s.app.Peers(s.iface)
 	if err != nil {
@@ -75,125 +92,74 @@ func (s *Syncer) Load() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.byKey = make(map[string]*peerState, len(peers))
+	s.base = make(map[string][]netip.Prefix, len(peers))
 	s.byAddr = make(map[netip.Addr]string, len(peers))
+	s.applied = make(map[string]string, len(peers))
 	for _, p := range peers {
-		ps := &peerState{
-			key:     p.Key,
-			allowed: append([]netip.Prefix(nil), p.AllowedIPs...),
-			managed: make(map[netip.Prefix]struct{}),
-		}
-		s.byKey[p.Key] = ps
-		for _, ip := range ps.allowed {
+		var tun []netip.Prefix
+		for _, ip := range p.AllowedIPs {
 			if ip.Bits() != 32 {
 				continue
 			}
-			if s.haveTunnel && !s.tunnelNet.Contains(ip.Addr()) {
+			if s.haveTun && !s.tunnelNet.Contains(ip.Addr()) {
 				continue
 			}
+			tun = append(tun, ip)
+		}
+		s.base[p.Key] = tun
+		for _, ip := range tun {
 			if _, ok := s.byAddr[ip.Addr()]; !ok {
 				s.byAddr[ip.Addr()] = p.Key
 			}
 		}
 	}
-	s.log.Info("loaded peers", "iface", s.iface, "peers", len(s.byKey), "tunnel_addrs", len(s.byAddr))
+	s.log.Info("loaded peers", "iface", s.iface, "peers", len(s.base), "tunnel_addrs", len(s.byAddr))
 	return nil
 }
 
-// Apply processes one decoded FPM message.
-func (s *Syncer) Apply(m fpm.Msg) {
-	switch m.Kind {
-	case fpm.KindNexthop:
-		if m.Nexthop != nil && m.Nexthop.HasGW {
-			s.mu.Lock()
-			s.nh[m.Nexthop.ID] = m.Nexthop.Gateway
-			s.mu.Unlock()
-		}
-	case fpm.KindRoute:
-		r := m.Route
-		if r == nil || !r.Prefix.IsValid() {
-			return
-		}
-		s.mu.Lock()
-		if m.Type == rtmDelRoute {
-			// A withdraw carries only the destination; resolve nothing.
-			s.delLocked(r.Prefix)
-		} else {
-			gw, ok := s.resolveGWLocked(r)
-			if !ok {
-				s.mu.Unlock()
-				return // no resolvable gateway: vec/connected/onlink -> not wg-relevant
-			}
-			s.addLocked(r.Prefix, gw)
-		}
-		s.mu.Unlock()
-		s.kickFlush()
+// Notify schedules a reconcile (debounced). Safe to call from any goroutine.
+func (s *Syncer) Notify() {
+	select {
+	case s.kick <- struct{}{}:
+	default:
 	}
 }
 
-func (s *Syncer) resolveGWLocked(r *fpm.Route) (netip.Addr, bool) {
-	if r.HasGW {
-		return r.Gateway, true
+// Reconcile reads the FIB and applies any changed peer allowed-ips.
+func (s *Syncer) Reconcile() error {
+	routes, err := s.rib(s.iface)
+	if err != nil {
+		return err
 	}
-	if r.HasNhID {
-		if gw, ok := s.nh[r.NexthopID]; ok {
-			return gw, true
-		}
-	}
-	return netip.Addr{}, false
-}
 
-func (s *Syncer) addLocked(p netip.Prefix, gw netip.Addr) {
-	key, ok := s.byAddr[gw]
-	if !ok {
-		return // gateway is not a wg peer tunnel addr
-	}
-	ps := s.byKey[key]
-	for _, a := range ps.allowed {
-		if a == p {
-			return // idempotent
-		}
-	}
-	ps.allowed = append(ps.allowed, p)
-	ps.managed[p] = struct{}{}
-	ps.dirty = true
-	s.log.Debug("route add", "prefix", p, "peer", short(key), "via", gw)
-}
-
-func (s *Syncer) delLocked(p netip.Prefix) {
-	for _, ps := range s.byKey {
-		if _, ok := ps.managed[p]; !ok {
-			continue // only remove prefixes we learned; protects base tunnel /32
-		}
-		out := ps.allowed[:0]
-		for _, a := range ps.allowed {
-			if a != p {
-				out = append(out, a)
-			}
-		}
-		ps.allowed = out
-		delete(ps.managed, p)
-		ps.dirty = true
-		s.log.Debug("route del", "prefix", p, "peer", short(ps.key))
-	}
-}
-
-// Flush applies the current desired state for every dirty peer.
-func (s *Syncer) Flush() error {
 	s.mu.Lock()
+	desired := make(map[string][]netip.Prefix, len(s.base))
+	for k, b := range s.base {
+		desired[k] = append([]netip.Prefix(nil), b...)
+	}
+	for p, gw := range routes {
+		key, ok := s.byAddr[gw]
+		if !ok {
+			continue
+		}
+		if hasPrefix(desired[key], p) {
+			continue
+		}
+		desired[key] = append(desired[key], p)
+	}
+
 	type job struct {
 		key string
 		ips []netip.Prefix
 	}
 	var jobs []job
-	for _, ps := range s.byKey {
-		if !ps.dirty {
+	for key, ips := range desired {
+		sort.Slice(ips, func(i, j int) bool { return ips[i].String() < ips[j].String() })
+		ser := serialize(ips)
+		if s.applied[key] == ser {
 			continue
 		}
-		ips := append([]netip.Prefix(nil), ps.allowed...)
-		sort.Slice(ips, func(i, j int) bool { return ips[i].String() < ips[j].String() })
-		jobs = append(jobs, job{ps.key, ips})
-		ps.dirty = false
+		jobs = append(jobs, job{key, ips})
 	}
 	s.mu.Unlock()
 
@@ -206,18 +172,29 @@ func (s *Syncer) Flush() error {
 			}
 			continue
 		}
+		s.mu.Lock()
+		s.applied[j.key] = serialize(j.ips)
+		s.mu.Unlock()
 		s.log.Info("applied allowed-ips", "peer", short(j.key), "count", len(j.ips))
 	}
 	return firstErr
 }
 
-// Run coalesces flushes until ctx is cancelled.
+// Run reconciles on FPM events (debounced) and periodically.
 func (s *Syncer) Run(ctx context.Context) {
 	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {
 		<-timer.C
 	}
 	defer timer.Stop()
+
+	var tick <-chan time.Time
+	if s.reconcile > 0 {
+		t := time.NewTicker(s.reconcile)
+		defer t.Stop()
+		tick = t.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -229,20 +206,34 @@ func (s *Syncer) Run(ctx context.Context) {
 				default:
 				}
 			}
-			timer.Reset(s.flushEvery)
+			timer.Reset(s.flush)
 		case <-timer.C:
-			if err := s.Flush(); err != nil {
-				s.log.Error("flush", "err", err)
+			if err := s.Reconcile(); err != nil {
+				s.log.Error("reconcile", "err", err)
+			}
+		case <-tick:
+			if err := s.Reconcile(); err != nil {
+				s.log.Error("reconcile", "err", err)
 			}
 		}
 	}
 }
 
-func (s *Syncer) kickFlush() {
-	select {
-	case s.kick <- struct{}{}:
-	default:
+func hasPrefix(list []netip.Prefix, p netip.Prefix) bool {
+	for _, x := range list {
+		if x == p {
+			return true
+		}
 	}
+	return false
+}
+
+func serialize(ips []netip.Prefix) string {
+	ss := make([]string, len(ips))
+	for i, p := range ips {
+		ss[i] = p.String()
+	}
+	return strings.Join(ss, ",")
 }
 
 func short(key string) string {

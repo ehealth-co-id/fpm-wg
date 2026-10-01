@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/ehealthid/fpm-wg/internal/config"
+	"github.com/ehealthid/fpm-wg/internal/rib"
 	"github.com/ehealthid/fpm-wg/internal/server"
 	"github.com/ehealthid/fpm-wg/internal/syncer"
 	wg "github.com/ehealthid/fpm-wg/internal/wg"
@@ -62,6 +63,10 @@ func run(cfgPath, listen, iface, applier, tunnelNet, logLevel string) error {
 	if err != nil {
 		return fmt.Errorf("flush_interval: %w", err)
 	}
+	reconcileEvery, err := cfg.ReconcileDuration()
+	if err != nil {
+		return fmt.Errorf("reconcile_interval: %w", err)
+	}
 
 	app, err := newApplier(cfg.Applier)
 	if err != nil {
@@ -76,7 +81,15 @@ func run(cfgPath, listen, iface, applier, tunnelNet, logLevel string) error {
 		}
 	}
 
-	syn := syncer.New(cfg.Interface, tnet, app, flushEvery, log)
+	syn := syncer.New(syncer.Options{
+		Iface:             cfg.Interface,
+		TunnelNet:         tnet,
+		Applier:           app,
+		RIB:               rib.Routes,
+		FlushInterval:     flushEvery,
+		ReconcileInterval: reconcileEvery,
+		Logger:            log,
+	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -85,7 +98,7 @@ func run(cfgPath, listen, iface, applier, tunnelNet, logLevel string) error {
 
 	log.Info("fpm-wg starting",
 		"version", version, "interface", cfg.Interface, "tunnel_net", cfg.TunnelNet,
-		"applier", cfg.Applier, "flush_interval", flushEvery)
+		"applier", cfg.Applier, "flush_interval", flushEvery, "reconcile_interval", reconcileEvery)
 
 	srv := server.New(cfg.Listen, syn, log)
 	return srv.Serve(ctx)

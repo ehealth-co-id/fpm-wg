@@ -15,16 +15,24 @@ FRR zebra (-M dplane_fpm_nl)  ──netlink/TCP──▶  fpm-wg  ──▶  Wir
 ## How it works
 
 1. `fpm-wg` listens on `127.0.0.1:2620`; FRR's `dplane_fpm_nl` module dials in.
-2. On connect, FRR replays the whole RIB (walks), so state converges without
-   extra logic after a reboot or a `fpm-wg` restart.
-3. Each `RTM_NEWROUTE`/`RTM_DELROUTE` is decoded together with nexthop objects
-   (`RTM_NEWNEXTHOP`, default `use-next-hop-groups` = yes).
-4. A route's gateway is matched to a peer by its tunnel address (the peer's
-   `/32` allowed-ip inside `tunnel_net`). Route install ⇒ add prefix to that
-   peer; withdraw ⇒ strip the prefix from whichever peer holds it. Prefixes the
-   process did not add (e.g. the base tunnel `/32`) are never removed.
-5. Changes are coalesced over `flush_interval` and applied as a full-list
-   replace per peer, so the applier is called at most once per peer per window.
+2. **The stream is only a trigger.** On any dplane event (debounced by
+   `flush_interval`), fpm-wg re-reads the **kernel routing table** and recomputes
+   the desired allowed-ips for every peer.
+3. A route's gateway is matched to a peer by its tunnel address (the peer's
+   `/32` allowed-ip inside `tunnel_net`). Only each peer's own tunnel `/32` is
+   treated as base state; every other allowed-ip is derived from the FIB, so a
+   stale/wrong entry is corrected rather than adopted.
+4. Changes are applied as a full-list replace per peer, and only when the
+   desired state differs from what was last written (idempotent). A periodic
+   reconcile (`reconcile_interval`, default 30s) is a safety net.
+5. On connect FRR replays the whole RIB, so state converges after a reboot or a
+   `fpm-wg` restart.
+
+Why the kernel and not FRR's nexthop ids: with `use-next-hop-groups` (the
+default) routes reference nexthop objects by `RTA_NH_ID`. Those ids are
+**reused**, so resolving them from a cache attributes prefixes to the wrong
+peer after a group is renumbered — which silently breaks WireGuard cryptokey
+routing. Reading the FIB avoids that whole class of bug.
 
 ## Configuration
 
@@ -37,6 +45,7 @@ JSON (see `deploy/fpm-wg.json`); every field is overridable by flag.
   "tunnel_net": "192.168.200.0/24",
   "applier": "ctrl",
   "flush_interval": "100ms",
+  "reconcile_interval": "30s",
   "log_level": "info"
 }
 ```
@@ -47,7 +56,8 @@ JSON (see `deploy/fpm-wg.json`); every field is overridable by flag.
 | `interface` | WireGuard interface to manage |
 | `tunnel_net` | CIDR containing peer tunnel `/32`s (used to map gateway→peer) |
 | `applier` | `ctrl` (direct WireGuard netlink via wgctrl) or `exec` (shell out to `wg`) |
-| `flush_interval` | coalescing window |
+| `flush_interval` | coalescing window for event-driven reconciles |
+| `reconcile_interval` | periodic FIB re-read safety net; `0` disables |
 | `log_level` | `debug`/`info`/`warn`/`error` |
 
 ## FRR side

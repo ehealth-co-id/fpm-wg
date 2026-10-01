@@ -4,5 +4,6 @@
   "tunnel_net": "192.168.200.0/24",
   "applier": "ctrl",
   "flush_interval": "100ms",
+  "reconcile_interval": "30s",
   "log_level": "info"
 }
