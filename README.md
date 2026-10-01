@@ -70,13 +70,41 @@ Runtime CLI is module-namespaced: `show fpm status`, `show fpm counters`.
 > contains `fpm address`. Normal startup is unaffected. Do not use `zebra -C` to
 > validate an FPM config.
 
+## Install (release)
+
+`scripts/install.sh` downloads the latest GitHub **release** asset for the host
+architecture, installs `/usr/local/bin/fpm-wg`, writes a default
+`/etc/fpm-wg/config.json` (only if absent) and a systemd unit, then enables and
+starts the service.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ehealth-co-id/fpm-wg/master/scripts/install.sh | sudo bash
+# or, from a checkout:
+sudo bash scripts/install.sh
+```
+
+The installer never overwrites an existing config — set `tunnel_net` (and
+`interface`) there before relying on the service.
+
+For private forks, export a token (`Contents: read`); the script then downloads
+through the API asset endpoint instead:
+
+```bash
+sudo -E GITHUB_TOKEN=ghp_xxx bash scripts/install.sh
+```
+
 ## Build & test
 
 ```
 make build      # -> bin/fpm-wg (static, CGO disabled)
+make cross      # GOOS=linux GOARCH=<amd64|arm64> -> ./fpm-wg (release CI)
 make test
 make install
 ```
+
+Releases are produced by `.github/workflows/release.yml` on `v*` tags: it runs
+`go vet` + `go test`, then uploads `fpm-wg-linux-amd64` and
+`fpm-wg-linux-arm64` as release assets.
 
 ## Deploy
 
@@ -107,4 +135,6 @@ internal/wg       Applier interface: Ctrl (wgctrl) + Exec (wg CLI)
 internal/server   TCP listener + connection handling
 internal/config   JSON config
 deploy/           systemd unit + example config
+scripts/          install.sh (release installer)
+.github/          release workflow
 ```

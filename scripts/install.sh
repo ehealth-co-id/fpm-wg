@@ -10,6 +10,9 @@ CONFIG_DIR="/etc/fpm-wg"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
+# Optional: a token is only needed for private forks.
+TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+
 echo "[*] Installing ${SERVICE_NAME} from latest release..."
 
 # 1. Pre-flight checks
@@ -29,16 +32,32 @@ esac
 
 ASSET_NAME="${BINARY}-linux-${GOARCH}"
 
-# 2. Fetch latest release asset URL
+# 2. Fetch latest release information
 echo "[*] Fetching latest release information..."
-RELEASE_JSON=$(curl -fsSL \
+AUTH=()
+if [[ -n "$TOKEN" ]]; then
+  AUTH=(-H "Authorization: Bearer ${TOKEN}")
+fi
+
+RELEASE_JSON=$(curl -fsSL "${AUTH[@]}" \
   -H "Accept: application/vnd.github+json" \
   -H "User-Agent: fpm-wg-install" \
   "https://api.github.com/repos/${REPO}/releases/latest")
 
-ASSET_URL=$(echo "$RELEASE_JSON" | grep -oE "https://[^\"]+/${ASSET_NAME}\"" | head -1 | tr -d '"')
+if [[ -n "$TOKEN" ]]; then
+  # Private repo: the browser_download_url is not reachable; use the asset API.
+  ASSET_URL=$(printf '%s' "$RELEASE_JSON" \
+    | grep -oE "\"url\":\"https://api\.github\.com/repos/[^\"]*/releases/assets/[0-9]+\"[^{]*\"name\":\"${ASSET_NAME}\"" \
+    | head -1 \
+    | grep -oE 'https://[^"]+/releases/assets/[0-9]+')
+  DL=(-H "Authorization: Bearer ${TOKEN}" -H "Accept: application/octet-stream")
+else
+  ASSET_URL=$(printf '%s' "$RELEASE_JSON" \
+    | grep -oE "https://[^\"]+/${ASSET_NAME}\"" | head -1 | tr -d '"')
+  DL=()
+fi
 
-if [[ -z "$ASSET_URL" ]]; then
+if [[ -z "${ASSET_URL:-}" ]]; then
   echo "ERROR: Could not find release asset ${ASSET_NAME}"
   exit 1
 fi
@@ -51,7 +70,7 @@ systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
 # 3. Install binary
 echo "[*] Installing to ${INSTALL_DIR}/${BINARY}..."
 install -d "${INSTALL_DIR}"
-curl -fsSL -o "${INSTALL_DIR}/${BINARY}" "$ASSET_URL"
+curl -fsSL "${DL[@]}" -o "${INSTALL_DIR}/${BINARY}" "$ASSET_URL"
 chmod 755 "${INSTALL_DIR}/${BINARY}"
 
 # 4. Config (write a default if absent; never overwrite an existing one)
