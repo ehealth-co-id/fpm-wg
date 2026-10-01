@@ -17,6 +17,9 @@ import (
 	wg "github.com/ehealthid/fpm-wg/internal/wg"
 )
 
+// version is stamped at build time (-X main.version=...).
+var version = "dev"
+
 func main() {
 	cfgPath := flag.String("config", "", "path to JSON config file")
 	listen := flag.String("listen", "", "override listen address")
@@ -81,7 +84,7 @@ func run(cfgPath, listen, iface, applier, tunnelNet, logLevel string) error {
 	go syn.Run(ctx)
 
 	log.Info("fpm-wg starting",
-		"interface", cfg.Interface, "tunnel_net", cfg.TunnelNet,
+		"version", version, "interface", cfg.Interface, "tunnel_net", cfg.TunnelNet,
 		"applier", cfg.Applier, "flush_interval", flushEvery)
 
 	srv := server.New(cfg.Listen, syn, log)
