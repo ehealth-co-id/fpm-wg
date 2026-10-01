@@ -1,0 +1,27 @@
+[Unit]
+Description=fpm-wg - sync WireGuard allowed-ips from FRR dplane_fpm_nl
+Documentation=https://github.com/ehealthid/fpm-wg
+After=network-online.target wg-quick@wg0.service frr.service
+Wants=network-online.target
+Requires=wg-quick@wg0.service
+# frr.service is After= only: FRR may be restarted independently and will
+# reconnect + replay the RIB, which fpm-wg handles.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fpm-wg -config /etc/fpm-wg/config.json
+Restart=on-failure
+RestartSec=2
+# Programming WireGuard requires root; with the exec applier, restrict this
+# user or use a sudoers rule for `wg` instead.
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/fpm-wg
+# wgctrl/exec need netlink + wg socket access only.
+RestrictAddressFamilies=AF_INET AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

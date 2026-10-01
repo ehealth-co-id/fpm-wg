@@ -1,0 +1,8 @@
+{
+  "listen": "127.0.0.1:2620",
+  "interface": "wg0",
+  "tunnel_net": "192.168.200.0/24",
+  "applier": "ctrl",
+  "flush_interval": "100ms",
+  "log_level": "info"
+}
